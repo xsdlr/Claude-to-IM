@@ -14,7 +14,7 @@ import { initBridgeContext } from '../../lib/bridge/context';
 import { PLATFORM_LIMITS } from '../../lib/bridge/types';
 import { DingTalkAdapter } from '../../lib/bridge/adapters/dingtalk-adapter';
 import { forwardPermissionRequest } from '../../lib/bridge/permission-broker';
-import { EchoLLM } from '../../lib/bridge/examples/example-support';
+import { EchoLLM, InteractivePermissionGateway } from '../../lib/bridge/examples/example-support';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 import type { BridgeStore } from '../../lib/bridge/host';
 import type { OutboundMessage, SendResult } from '../../lib/bridge/types';
@@ -432,6 +432,26 @@ describe('permission-broker - dingtalk text fallback', () => {
     assert.equal(sentMessages[0].inlineButtons, undefined);
     assert.ok(sentMessages[0].text.includes('/perm allow perm-1'));
   });
+
+  it('stores a pending permission link even when dingtalk returns no messageId', async () => {
+    const adapter = createMockDingtalkAdapter({
+      sendFn: async () => ({ ok: true, messageId: undefined }),
+    });
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'dingtalk', chatId: 'cid-2' },
+      'perm-no-msgid',
+      'Bash',
+      { command: 'echo $JAVA_HOME' },
+      'session-1',
+    );
+
+    assert.equal(store.permissionLinks.length, 1);
+    assert.equal(store.permissionLinks[0].permissionRequestId, 'perm-no-msgid');
+    assert.equal(store.permissionLinks[0].chatId, 'cid-2');
+    assert.equal(store.permissionLinks[0].messageId, 'perm:perm-no-msgid');
+  });
 });
 
 describe('dingtalk demo echo response', () => {
@@ -465,5 +485,113 @@ describe('dingtalk demo echo response', () => {
     const payload = chunks.join('');
     assert.match(payload, /Files:/);
     assert.match(payload, /image\.png -> https:\/\/download\.example\.com\/image\.png/);
+  });
+});
+
+describe('interactive demo permission gateway', () => {
+  it('waits for explicit allow confirmation', async () => {
+    const gateway = new InteractivePermissionGateway();
+    const toolInput = {
+      command: 'printf \'<%s>\\n\' "$JAVA_HOME"',
+      description: '打印 JAVA_HOME 环境变量的值',
+    };
+
+    const pending = gateway.waitForDecision({
+      permissionRequestId: 'perm-allow-1',
+      toolUseID: 'tool-use-1',
+      toolInput,
+      signal: new AbortController().signal,
+    });
+
+    assert.equal(gateway.resolvePendingPermission('perm-allow-1', {
+      behavior: 'allow',
+    }), true);
+
+    await assert.doesNotReject(async () => {
+      const result = await pending;
+      assert.equal(result.behavior, 'allow');
+      assert.equal(result.toolUseID, 'tool-use-1');
+      if (result.behavior === 'allow') {
+        assert.deepEqual(result.updatedInput, toolInput);
+      }
+    });
+  });
+
+  it('waits for explicit deny confirmation', async () => {
+    const gateway = new InteractivePermissionGateway();
+
+    const pending = gateway.waitForDecision({
+      permissionRequestId: 'perm-deny-1',
+      toolUseID: 'tool-use-2',
+      toolInput: {
+        command: 'echo test',
+      },
+      signal: new AbortController().signal,
+    });
+
+    assert.equal(gateway.resolvePendingPermission('perm-deny-1', {
+      behavior: 'deny',
+      message: 'Denied in chat',
+    }), true);
+
+    const result = await pending;
+    assert.equal(result.behavior, 'deny');
+    assert.equal(result.toolUseID, 'tool-use-2');
+    if (result.behavior === 'deny') {
+      assert.equal(result.message, 'Denied in chat');
+    }
+  });
+
+  it('passes through updatedPermissions without broadening scope', async () => {
+    const gateway = new InteractivePermissionGateway();
+
+    const pending = gateway.waitForDecision({
+      permissionRequestId: 'perm-session-1',
+      toolUseID: 'tool-use-3',
+      toolInput: {
+        command: 'echo "$JAVA_HOME"',
+        description: '显示 JAVA_HOME 环境变量',
+      },
+      signal: new AbortController().signal,
+    });
+
+    assert.equal(gateway.resolvePendingPermission('perm-session-1', {
+      behavior: 'allow',
+      updatedPermissions: [
+        {
+          type: 'addRules',
+          behavior: 'allow',
+          destination: 'localSettings',
+          rules: [
+            {
+              toolName: 'Bash',
+              ruleContent: 'echo "$JAVA_HOME"',
+            },
+          ],
+        },
+      ],
+    }), true);
+
+    const result = await pending;
+    assert.equal(result.behavior, 'allow');
+    if (result.behavior === 'allow') {
+      assert.deepEqual(result.updatedInput, {
+        command: 'echo "$JAVA_HOME"',
+        description: '显示 JAVA_HOME 环境变量',
+      });
+      assert.deepEqual(result.updatedPermissions, [
+        {
+          type: 'addRules',
+          behavior: 'allow',
+          destination: 'localSettings',
+          rules: [
+            {
+              toolName: 'Bash',
+              ruleContent: 'echo "$JAVA_HOME"',
+            },
+          ],
+        },
+      ]);
+    }
   });
 });

@@ -113,14 +113,19 @@ export async function forwardPermissionRequest(
     result = await deliver(adapter, message, { sessionId });
   }
 
-  // Record the link so we can match callback queries back to this permission
-  if (result.ok && result.messageId) {
+  // Record the link so we can match callback queries back to this permission.
+  // For text-command channels like QQ / DingTalk, webhook replies may not return
+  // a usable platform message ID. Numeric shortcuts and /perm commands only need
+  // the permission ID + chat ID, so persist a synthetic message ID instead of
+  // dropping the link entirely.
+  if (result.ok) {
     try {
+      const linkMessageId = result.messageId || `perm:${permissionRequestId}`;
       store.insertPermissionLink({
         permissionRequestId,
         channelType: adapter.channelType,
         chatId: address.chatId,
-        messageId: result.messageId,
+        messageId: linkMessageId,
         toolName,
         suggestions: suggestions ? JSON.stringify(suggestions) : '',
       });
